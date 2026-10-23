@@ -23,7 +23,7 @@ export const namespace = (server: string) => server.replace(/[^a-zA-Z0-9_-]/g, "
 export const name = (server: string, tool: string) => `${namespace(server)}_${tool.replace(/[^a-zA-Z0-9_-]/g, "_")}`
 
 export interface Interface {
-  /** Wait for the initial MCP tool registration to settle. */
+  /** Wait for the initial MCP tool registration and for servers still starting to register their tools. */
   readonly flush: Effect.Effect<void>
 }
 
@@ -137,7 +137,14 @@ export const layer = Layer.effect(
       Stream.runForEach(() => reconcile),
       Effect.forkScoped({ startImmediately: true }),
     )
-    return Service.of({ flush: Effect.asVoid(Fiber.await(initial)) })
+    return Service.of({
+      // Initial connections are asynchronous. Without waiting here, a request made while a server is
+      // still starting would go out without its tools, which only arrive with a later refresh.
+      flush: Effect.gen(function* () {
+        yield* Fiber.await(initial)
+        if (yield* mcp.settle()) yield* reconcile
+      }),
+    })
   }),
 )
 

@@ -388,6 +388,7 @@ const settled = (service: Mcp.Interface, name = "resources") =>
   }).pipe(Effect.retry({ times: 200, schedule: Schedule.spaced("10 millis") }))
 
 const mcp = Layer.mock(Mcp.Service, {
+  settle: () => Effect.succeed(false),
   tools: () =>
     Effect.succeed([
       {
@@ -2322,6 +2323,7 @@ testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog up
           AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Bus.node]), [
             Mcp.node.replace(
               Layer.mock(Mcp.Service, {
+                settle: () => Effect.succeed(false),
                 tools: () => Ref.get(catalog),
                 callTool: (input) =>
                   Effect.succeed({
@@ -2336,6 +2338,48 @@ testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog up
             Image.node.replace(imagePassthrough),
           ]),
         ),
+      ),
+    )
+  }),
+)
+
+testEffect(Layer.empty).live("waits for a starting MCP server before advertising its direct tools", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const server = yield* resourceServer({
+      respond: (request) =>
+        request.method !== "POST"
+          ? undefined
+          : Effect.runPromise(
+              Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(undefined)),
+            ),
+    })
+
+    yield* Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const registration = yield* McpTool.Service
+      yield* Deferred.await(started)
+      const flushed = yield* registration.flush.pipe(Effect.forkChild({ startImmediately: true }))
+      expect(flushed.pollUnsafe()).toBeUndefined()
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(flushed)
+      const toolSet = yield* registry.snapshot()
+      expect(toolSet.definitions.map((tool) => tool.name)).toEqual(["resources_echo", "execute"])
+      expect(codeModeListings(toolSet.codeModeCatalog!).map((tool) => tool.path)).not.toContain("resources.echo")
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+      Effect.provide(
+        AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
+          Mcp.node.replace(
+            resourceMcpLayer(new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false, codemode: false })),
+          ),
+          Permission.node.replace(permissions),
+          Bus.node.replace(events),
+          Image.node.replace(imagePassthrough),
+          Global.node.replace(Global.layerWith({ data: outputData })),
+        ]),
       ),
     )
   }),
@@ -2364,6 +2408,7 @@ testEffect(Layer.empty).effect("coalesces queued MCP tool notifications after in
       AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Bus.node]), [
         Mcp.node.replace(
           Layer.mock(Mcp.Service, {
+            settle: () => Effect.succeed(false),
             tools: () =>
               Effect.sync(() => [
                 {

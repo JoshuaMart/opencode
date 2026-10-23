@@ -135,6 +135,8 @@ export interface Interface extends State.Transformable<Editor> {
    * name until it closes, then the most recent remaining connection takes over.
    */
   readonly attach: (name: string, transport: Transport) => Effect.Effect<void, McpClient.ConnectError, Scope.Scope>
+  /** Waits for servers still starting to connect or fail, and reports whether any was starting. */
+  readonly settle: () => Effect.Effect<boolean>
   readonly tools: () => Effect.Effect<Tool[]>
   readonly callTool: (input: {
     readonly server: ServerName | string
@@ -760,6 +762,11 @@ export const layer = (options?: Options) =>
           return Array.from(entries)
             .toSorted(([a], [b]) => a.localeCompare(b))
             .map(([name, entry]): ServerInfo => ({ name, status: entry.status, integrationID: entry.integrationID }))
+        }),
+        settle: Effect.fn("MCP.settle")(function* () {
+          const starting = Array.from(entries.values()).filter((entry) => entry.status.status === "pending")
+          yield* Effect.forEach(starting, (entry) => entry.startup.await, { discard: true })
+          return starting.length > 0
         }),
         add: Effect.fn("MCP.add")(function* (server, config) {
           const name = ServerName.make(server)
