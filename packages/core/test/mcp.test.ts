@@ -388,7 +388,6 @@ const settled = (service: Mcp.Interface, name = "resources") =>
   }).pipe(Effect.retry({ times: 200, schedule: Schedule.spaced("10 millis") }))
 
 const mcp = Layer.mock(Mcp.Service, {
-  settle: () => Effect.succeed(false),
   tools: () =>
     Effect.succeed([
       {
@@ -2323,7 +2322,6 @@ testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog up
           AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Bus.node]), [
             Mcp.node.replace(
               Layer.mock(Mcp.Service, {
-                settle: () => Effect.succeed(false),
                 tools: () => Ref.get(catalog),
                 callTool: (input) =>
                   Effect.succeed({
@@ -2343,44 +2341,107 @@ testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog up
   }),
 )
 
-testEffect(Layer.empty).live("waits for a starting MCP server before advertising its direct tools", () =>
-  Effect.gen(function* () {
-    const started = yield* Deferred.make<void>()
-    const release = yield* Deferred.make<void>()
-    const server = yield* resourceServer({
-      respond: (request) =>
-        request.method !== "POST"
-          ? undefined
-          : Effect.runPromise(
-              Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(undefined)),
-            ),
-    })
+// Holds the server's handshake until the test releases it, so its startup stays pending.
+const gatedServer = Effect.gen(function* () {
+  const started = yield* Deferred.make<void>()
+  const release = yield* Deferred.make<void>()
+  const server = yield* resourceServer({
+    respond: (request) =>
+      request.method !== "POST"
+        ? undefined
+        : Effect.runPromise(
+            Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(undefined)),
+          ),
+  })
+  return { server, started, release }
+})
 
+// The bus never delivers ToolsChanged, so only flush and ready move MCP tools into the registry.
+const directMcpTools = (url: string, timeout?: { readonly wait: number }) =>
+  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Mcp.node]), [
+    Mcp.node.replace(
+      resourceMcpLayer(new ConfigMCP.Remote({ type: "remote", url, oauth: false, codemode: false, timeout })),
+    ),
+    Permission.node.replace(permissions),
+    Bus.node.replace(events),
+    Image.node.replace(imagePassthrough),
+    Global.node.replace(Global.layerWith({ data: outputData })),
+  ])
+
+testEffect(Layer.empty).live("waits for a starting MCP server before a session's first request", () =>
+  Effect.gen(function* () {
+    const gate = yield* gatedServer
     yield* Effect.gen(function* () {
       const registry = yield* Tool.Service
       const registration = yield* McpTool.Service
-      yield* Deferred.await(started)
-      const flushed = yield* registration.flush.pipe(Effect.forkChild({ startImmediately: true }))
-      expect(flushed.pollUnsafe()).toBeUndefined()
+      yield* Deferred.await(gate.started)
+      const ready = yield* registration.ready.pipe(Effect.forkChild({ startImmediately: true }))
+      expect(ready.pollUnsafe()).toBeUndefined()
 
-      yield* Deferred.succeed(release, undefined)
-      yield* Fiber.join(flushed)
+      yield* Deferred.succeed(gate.release, undefined)
+      yield* Fiber.join(ready)
       const toolSet = yield* registry.snapshot()
       expect(toolSet.definitions.map((tool) => tool.name)).toEqual(["resources_echo", "execute"])
       expect(codeModeListings(toolSet.codeModeCatalog!).map((tool) => tool.path)).not.toContain("resources.echo")
     }).pipe(
-      Effect.ensuring(Deferred.succeed(release, undefined)),
-      Effect.provide(
-        AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
-          Mcp.node.replace(
-            resourceMcpLayer(new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false, codemode: false })),
-          ),
-          Permission.node.replace(permissions),
-          Bus.node.replace(events),
-          Image.node.replace(imagePassthrough),
-          Global.node.replace(Global.layerWith({ data: outputData })),
-        ]),
-      ),
+      // Release the handshake before the MCP layer closes, or its shutdown waits for the startup.
+      Effect.ensuring(Deferred.succeed(gate.release, undefined)),
+      Effect.provide(directMcpTools(gate.server.url)),
+    )
+  }),
+)
+
+testEffect(Layer.empty).live("does not wait for a starting MCP server after a session's first request", () =>
+  Effect.gen(function* () {
+    const gate = yield* gatedServer
+    yield* Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const registration = yield* McpTool.Service
+      const mcp = yield* Mcp.Service
+      yield* Deferred.await(gate.started)
+      yield* registration.flush
+      expect((yield* mcp.servers())[0]?.status).toEqual({ status: "pending" })
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
+    }).pipe(
+      // Release the handshake before the MCP layer closes, or its shutdown waits for the startup.
+      Effect.ensuring(Deferred.succeed(gate.release, undefined)),
+      Effect.provide(directMcpTools(gate.server.url)),
+    )
+  }),
+)
+
+testEffect(Layer.empty).live("registers a connected MCP server's tools before a session's first request", () =>
+  Effect.gen(function* () {
+    const server = yield* resourceServer()
+    yield* Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const registration = yield* McpTool.Service
+      expect(yield* settled(yield* Mcp.Service)).toEqual({ status: "connected" })
+      // Connected, but its ToolsChanged refresh has not reached the registry yet.
+      yield* registration.flush
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
+
+      yield* registration.ready
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["resources_echo", "execute"])
+    }).pipe(Effect.provide(directMcpTools(server.url)))
+  }),
+)
+
+testEffect(Layer.empty).live("waits for a hung MCP server only up to its wait timeout", () =>
+  Effect.gen(function* () {
+    const gate = yield* gatedServer
+    yield* Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const registration = yield* McpTool.Service
+      const mcp = yield* Mcp.Service
+      yield* Deferred.await(gate.started)
+      yield* registration.ready
+      expect((yield* mcp.servers())[0]?.status).toEqual({ status: "pending" })
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
+    }).pipe(
+      // Release the handshake before the MCP layer closes, or its shutdown waits for the startup.
+      Effect.ensuring(Deferred.succeed(gate.release, undefined)),
+      Effect.provide(directMcpTools(gate.server.url, { wait: 50 })),
     )
   }),
 )
@@ -2408,7 +2469,6 @@ testEffect(Layer.empty).effect("coalesces queued MCP tool notifications after in
       AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Bus.node]), [
         Mcp.node.replace(
           Layer.mock(Mcp.Service, {
-            settle: () => Effect.succeed(false),
             tools: () =>
               Effect.sync(() => [
                 {
