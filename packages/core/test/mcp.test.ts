@@ -2398,10 +2398,13 @@ const gatedServer = Effect.gen(function* () {
 })
 
 // The bus never delivers ToolsChanged, so only flush and ready move MCP tools into the registry.
-const directMcpTools = (url: string, timeout?: { readonly wait: number }) =>
+const directMcpTools = (
+  url: string,
+  options: { readonly timeout?: { readonly wait: number }; readonly protocol?: "2026-07-28" } = {},
+) =>
   AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Mcp.node]), [
     Mcp.node.replace(
-      resourceMcpLayer(new ConfigMCP.Remote({ type: "remote", url, oauth: false, codemode: false, timeout })),
+      resourceMcpLayer(new ConfigMCP.Remote({ type: "remote", url, oauth: false, codemode: false, ...options })),
     ),
     Permission.node.replace(permissions),
     Bus.node.replace(events),
@@ -2440,7 +2443,7 @@ testEffect(Layer.empty).live("does not wait for a starting MCP server after a se
       const registration = yield* McpTool.Service
       const mcp = yield* Mcp.Service
       yield* Deferred.await(gate.started)
-      yield* registration.flush
+      yield* registration.sync
       expect((yield* mcp.servers())[0]?.status).toEqual({ status: "pending" })
       expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
     }).pipe(
@@ -2451,7 +2454,7 @@ testEffect(Layer.empty).live("does not wait for a starting MCP server after a se
   }),
 )
 
-testEffect(Layer.empty).live("registers a connected MCP server's tools before a session's first request", () =>
+testEffect(Layer.empty).live("registers a connected MCP server's tools on any request", () =>
   Effect.gen(function* () {
     const server = yield* resourceServer()
     yield* Effect.gen(function* () {
@@ -2462,9 +2465,32 @@ testEffect(Layer.empty).live("registers a connected MCP server's tools before a 
       yield* registration.flush
       expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
 
-      yield* registration.ready
+      yield* registration.sync
       expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["resources_echo", "execute"])
     }).pipe(Effect.provide(directMcpTools(server.url)))
+  }),
+)
+
+testEffect(Layer.empty).live("registers a replaced MCP server's tools on the next request", () =>
+  Effect.gen(function* () {
+    const server = yield* resourceServer({ modern: true })
+    yield* Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const registration = yield* McpTool.Service
+      const mcp = yield* Mcp.Service
+      expect(yield* settled(mcp)).toEqual({ status: "connected" })
+      yield* registration.sync
+      // Replacing a server stops it first; a refresh in that window empties the registry.
+      yield* mcp.transform((editor) => editor.update("resources", (config) => (config.disabled = true)))
+      yield* registration.sync
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
+
+      yield* mcp.transform((editor) => editor.update("resources", (config) => (config.disabled = false)))
+      expect(yield* settled(mcp)).toEqual({ status: "connected" })
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["execute"])
+      yield* registration.sync
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["resources_echo", "execute"])
+    }).pipe(Effect.provide(directMcpTools(server.url, { protocol: "2026-07-28" })))
   }),
 )
 
@@ -2482,7 +2508,7 @@ testEffect(Layer.empty).live("waits for a hung MCP server only up to its wait ti
     }).pipe(
       // Release the handshake before the MCP layer closes, or its shutdown waits for the startup.
       Effect.ensuring(Deferred.succeed(gate.release, undefined)),
-      Effect.provide(directMcpTools(gate.server.url, { wait: 50 })),
+      Effect.provide(directMcpTools(gate.server.url, { timeout: { wait: 50 } })),
     )
   }),
 )

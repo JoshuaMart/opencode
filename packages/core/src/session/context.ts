@@ -1,6 +1,5 @@
 export * as SessionContext from "./context.js"
 
-import { and, eq } from "drizzle-orm"
 import { Model } from "../model.js"
 import { Permission } from "../permission.js"
 import { Context, Effect, Layer } from "effect"
@@ -24,7 +23,6 @@ import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
-import { SessionMessageTable } from "./sql.js"
 import { SessionStore } from "./store.js"
 
 export interface Selection {
@@ -92,6 +90,7 @@ const layer = Layer.effect(
     const registry = yield* Tool.Service
 
     const resolveModel = (session: SessionSchema.Info) => models.resolve(session, model.available)
+    const served = new Set<SessionSchema.ID>()
 
     const selectTitle = Effect.fn("SessionContext.selectTitle")(function* (session: SessionSchema.Info) {
       const agent = yield* agents.get(Agent.ID.make("title"))
@@ -131,16 +130,11 @@ const layer = Layer.effect(
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
 
-      // MCP servers start in the background. Only a session's first model request waits for them,
-      // within a short bound, so a new session can use a slow server's tools without later steps paying.
-      const answered = yield* db
-        .select({ id: SessionMessageTable.id })
-        .from(SessionMessageTable)
-        .where(and(eq(SessionMessageTable.session_id, session.id), eq(SessionMessageTable.type, "assistant")))
-        .limit(1)
-        .get()
-        .pipe(Effect.orDie)
-      yield* answered ? mcpTools.flush : mcpTools.ready
+      // MCP servers start in the background with this Location. A session's first request here, new or
+      // resumed, waits for them within a short bound; later requests only pick up connected tools.
+      const first = !served.has(session.id)
+      served.add(session.id)
+      yield* first ? mcpTools.ready : mcpTools.sync
       const agent = yield* agents.select(session.agent)
       if (!agent.info) return yield* new AgentNotFoundError({ sessionID: session.id, agent: session.agent ?? agent.id })
       // Session permissions narrow discovery the same way they narrow the tool snapshot.

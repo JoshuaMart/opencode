@@ -25,9 +25,11 @@ export const name = (server: string, tool: string) => `${namespace(server)}_${to
 export interface Interface {
   /** Wait for the initial MCP tool registration to settle. */
   readonly flush: Effect.Effect<void>
+  /** Like `flush`, then register the tools of every connected server without waiting for the rest. */
+  readonly sync: Effect.Effect<void>
   /**
-   * Like `flush`, then wait, within each server's `timeout.wait`, for servers still starting, and
-   * register the tools of every connected server. For a session's first model request only.
+   * Like `sync`, after waiting, within each server's `timeout.wait`, for servers still starting. For a
+   * session's first model request in this process only.
    */
   readonly ready: Effect.Effect<void>
 }
@@ -143,17 +145,19 @@ export const layer = Layer.effect(
       Effect.forkScoped({ startImmediately: true }),
     )
     const flush = Effect.asVoid(Fiber.await(initial))
+    // A connected or replaced server's tools reach the registry only with the debounced refresh.
+    // Compare with what is connected rather than trusting server status; the read is in memory.
+    const sync = Effect.gen(function* () {
+      yield* flush
+      const connected = yield* mcp.tools()
+      if (connected.length !== discovered.length || connected.some((tool, index) => tool !== discovered[index]))
+        yield* reconcile
+    })
     return Service.of({
       flush,
-      // Initial connections are asynchronous, and a connected server's tools reach the registry only
-      // with the debounced refresh. Compare with what is connected rather than trusting server status.
-      ready: Effect.gen(function* () {
-        yield* flush
-        yield* mcp.settle()
-        const connected = yield* mcp.tools()
-        if (connected.length !== discovered.length || connected.some((tool, index) => tool !== discovered[index]))
-          yield* reconcile
-      }),
+      sync,
+      // Initial connections are asynchronous, so a request made while a server starts would miss it.
+      ready: mcp.settle().pipe(Effect.andThen(sync)),
     })
   }),
 )

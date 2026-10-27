@@ -119,10 +119,10 @@ const discovery = Layer.mock(InstructionDiscovery.Service, {
 const skills = Layer.mock(SkillInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
 const references = Layer.mock(ReferenceInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
 const mcp = Layer.mock(McpInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
-const mcpWaits: Array<"flush" | "ready"> = []
+const mcpWaits: Array<"sync" | "ready"> = []
 const mcpTools = Layer.mock(McpTool.Service, {
-  flush: Effect.sync(() => {
-    mcpWaits.push("flush")
+  sync: Effect.sync(() => {
+    mcpWaits.push("sync")
   }),
   ready: Effect.sync(() => {
     mcpWaits.push("ready")
@@ -265,12 +265,12 @@ const setup = Effect.gen(function* () {
   }
 })
 
-it.effect("waits for MCP servers only before a session's first model request", () =>
+it.effect("waits for MCP servers only before a session's first request in this process", () =>
   Effect.gen(function* () {
     mcpWaits.length = 0
     const { bus } = yield* setup
     const context = yield* SessionContext.Service
-    yield* context.select(sessionID)
+    // A resumed session already has answers, but this process has not served it yet.
     yield* bus.publish(SessionEvent.Step.Started, {
       sessionID,
       assistantMessageID: SessionMessage.ID.create(),
@@ -279,7 +279,8 @@ it.effect("waits for MCP servers only before a session's first model request", (
       started: 0,
     })
     yield* context.select(sessionID)
-    expect(mcpWaits).toEqual(["ready", "flush"])
+    yield* context.select(sessionID)
+    expect(mcpWaits).toEqual(["ready", "sync"])
   }),
 )
 
